@@ -36,14 +36,21 @@
 #include "sds.h"
 #include "zmalloc.h"
 
+// 一定要养成, 看着 C, 立马想到 汇编代码 的原理.
 sds sdsnewlen(const void *init, size_t initlen) {
-    struct sdshdr *sh;
+    // 此处的 sdshdr, 是引入的 sds.h 中的 struct sdshdr.
+    struct sdshdr *sh; // subq $8, %esp
 
-    if (init) {
+    if (init) { 
+        // 8 + 5 + 1 [此处的 5 以 hello 为例, 为什么要加 1 呢？因为要以 \0 作为结束标识]
+        // movq $N, %rsi
+        // call zmalloc
+        // movq %rax, ($8, %esp)
         sh = zmalloc(sizeof(struct sdshdr)+initlen+1);
     } else {
         sh = zcalloc(sizeof(struct sdshdr)+initlen+1);
     }
+    // cmp/test JZ(查手册)
     if (sh == NULL) return NULL;
     sh->len = initlen;
     sh->free = 0;

@@ -2700,32 +2700,45 @@ void redisOutOfMemoryHandler(size_t allocation_size) {
     redisPanic("Redis aborting for OUT OF MEMORY");
 }
 
+/*
+通过源码我们得知如下流程信息:
+1.Redis在启动时，将会初始化服务器响应的配置信息，这些配置信息我们在后面用到时再详细讲解
+2.解析参数并根据客户端参数加载并解析配置文件，然后进一步初始化Redis Server的变量信息
+3.检测内核的内存分配策略参数
+4.检测TCP FD与Unix FD
+5.设置事件循环eventloop并启动主循环处理程序
+6.结束后删除事件循环结构
+*/
 int main(int argc, char **argv) {
     struct timeval tv;
 
     /* We need to initialize our libraries, and the server configuration. */
-    zmalloc_enable_thread_safeness();
-    zmalloc_set_oom_handler(redisOutOfMemoryHandler);
-    srand(time(NULL)^getpid());
-    gettimeofday(&tv,NULL);
-    dictSetHashFunctionSeed(tv.tv_sec^tv.tv_usec^getpid());
-    server.sentinel_mode = checkForSentinelMode(argc,argv);
-    initServerConfig();
+    zmalloc_enable_thread_safeness(); // 设置 zmalloc_enable_thread_safeness = 1
+    zmalloc_set_oom_handler(redisOutOfMemoryHandler); // 设置发生 OOM 时回调的参数
+    srand(time(NULL)^getpid()); // 使当前进程的 ID(getpid()) 与当前时间一起初始化随机数种子 
+    gettimeofday(&tv,NULL); // 获取当前时间, 放进 timeval 结构体验
+    // 使用当前时间的秒信息(tv_sec)与毫秒信息(tv_usec) 与进程ID 设置变量 static uint32_t dict_hash_function_seed = 5381,
+    // 在 hash 函数中是用来散列 key-value
+    dictSetHashFunctionSeed(tv.tv_sec^tv.tv_usec^getpid()); 
+    server.sentinel_mode = checkForSentinelMode(argc,argv); // 从参数中解析, 看看是否以哨兵模式启动, 先忽略
+    initServerConfig(); // 初始化 Redis 服务器的相关配置信息
 
     /* We need to init sentinel right now as parsing the configuration file
      * in sentinel mode will have the effect of populating the sentinel
      * data structures with master nodes to monitor. */
-    if (server.sentinel_mode) {
+    if (server.sentinel_mode) { // 初始化哨兵模式
         initSentinelConfig();
         initSentinel();
     }
 
-    if (argc >= 2) {
+    if (argc >= 2) { // 解析参数
         int j = 1; /* First option to parse in argv[] */
-        sds options = sdsempty();
+        // 分配一个 redis 字符串来保存参数(后面会详细解释sds, 现在只需要知道它是一个字符串即可)
+        sds options = sdsempty(); 
         char *configfile = NULL;
 
         /* Handle special options --help and --version */
+        // 根据参数值完成相应处理
         if (strcmp(argv[1], "-v") == 0 ||
             strcmp(argv[1], "--version") == 0) version();
         if (strcmp(argv[1], "--help") == 0 ||
@@ -2751,48 +2764,62 @@ int main(int argc, char **argv) {
         while(j != argc) {
             if (argv[j][0] == '-' && argv[j][1] == '-') {
                 /* Option name */
+                // 解析参数名
                 if (sdslen(options)) options = sdscat(options,"\n");
                 options = sdscat(options,argv[j]+2);
                 options = sdscat(options," ");
             } else {
                 /* Option argument */
+                // 解析参数值
                 options = sdscatrepr(options,argv[j],strlen(argv[j]));
                 options = sdscat(options," ");
             }
             j++;
         }
-        resetServerSaveParams();
-        loadServerConfig(configfile,options);
-        sdsfree(options);
-    } else {
+        resetServerSaveParams(); // 重置服务器参数: server.saveparams = NULL
+        loadServerConfig(configfile,options); // 根据参数中指定的配置文件和参数初始化服务器配置
+        sdsfree(options); // 启动参数主要用于初始化服务器配置, 使用完毕后释放其占用空间
+    } else { // 没有指定配置文件, 那么打印警告信息
         redisLog(REDIS_WARNING, "Warning: no config file specified, using the default config. In order to specify a config file use %s /path/to/%s.conf", argv[0], server.sentinel_mode ? "sentinel" : "redis");
     }
+    // 如果指定 Redis 作为后台进程运行, 那么调用 daemonize fork 出另外的进程在后台运行
     if (server.daemonize) daemonize();
-    initServer();
-    if (server.daemonize) createPidFile();
-    redisAsciiArt();
+    initServer(); // 完成 Redis Server 的剩余变量初始化
+    // 若 Redis 在后台执行, 那么创建 pid 文件, 告知当前正在后台执行的 Redis pid 信息
+    if (server.daemonize) createPidFile(); 
+    redisAsciiArt(); // 打印 Redis ASCII 编码的图形（忽略）
 
-    if (!server.sentinel_mode) {
+    if (!server.sentinel_mode) { // 执行只有在不运行哨兵模式时才需要的动作
         /* Things only needed when not running in Sentinel mode. */
         redisLog(REDIS_WARNING,"Server started, Redis version " REDIS_VERSION);
+        /* 
+        如果在Linux平台下， 指定了OvercommitMemory为0， 那么打印警告日志(注:
+        overcommit_ _memory=0，表示内核将检查 是否有足够的可用内存供应用进程使用，
+                               如果有足够的可用内存，内存申请允许，否则，内存申请失败，并把错误返回给应用进程。
+        overcommit_ memory=1, 表示内核允许分配所有的物理内存，而不管当前的内存状态如何。
+        overcommit_ memory=2，表示内核允许分配超过所有物理内存和swap空间总和的内存)
+        */
     #ifdef __linux__
         linuxOvercommitMemoryWarning();
     #endif
-        loadDataFromDisk();
-        if (server.ipfd > 0)
+        loadDataFromDisk(); // 从磁盘中加载之前保存的 RDB 或者 AOF 文件
+        if (server.ipfd > 0) // 正确设置TCP socket FD文件描述符，表明当前可以正确接收来自客户端的 TCP 连接
             redisLog(REDIS_NOTICE,"The server is now ready to accept connections on port %d", server.port);
+        // if (server.sofd> 0) //. 正确设置Unix socket FD文件描述符，表明当前可以正确接收来自本机进
+        // 程的Unix套接字连接(什么是Unix套接字? -种本地进程通讯的方式，不经过协议栈，但可以使用Socket来完成通讯)
         if (server.sofd > 0)
             redisLog(REDIS_NOTICE,"The server is now ready to accept connections at %s", server.unixsocket);
     }
 
     /* Warning the user about suspicious maxmemory setting. */
+    // 检查用户设置的内存是否足够, 需要大于1M
     if (server.maxmemory > 0 && server.maxmemory < 1024*1024) {
         redisLog(REDIS_WARNING,"WARNING: You specified a maxmemory value that is less than 1MB (current value is %llu bytes). Are you sure this is what you really want?", server.maxmemory);
     }
 
-    aeSetBeforeSleepProc(server.el,beforeSleep);
-    aeMain(server.el);
-    aeDeleteEventLoop(server.el);
+    aeSetBeforeSleepProc(server.el,beforeSleep); // 设置执行睡眠前的回调函数: eventLoop->beforesleep = beforesleep
+    aeMain(server.el); // 执行主事件函数, 准备处理好的事件
+    aeDeleteEventLoop(server.el); // 退出循环, 表明当前需要关闭 Redis, 那么关闭打开的事件循环
     return 0;
 }
 
